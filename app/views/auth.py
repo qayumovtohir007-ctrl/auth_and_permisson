@@ -1,0 +1,93 @@
+from datetime import timedelta
+from tokenize import TokenError
+
+from django.contrib.auth.middleware import get_user
+from rest_framework import status, generics
+from rest_framework.generics import (
+    CreateAPIView, GenericAPIView,
+)
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.utils import timezone
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from app.models import User, EmailCode
+from app.serializers import RegisterSerializer, LogoutModelSerializer, VerifyEmailSerializer, ResendCodeSerializer
+from app.services import send_verification_code, confirm_code, finish_code
+from app.services.pre_token import make_pre_token
+
+
+
+class RegisterView(generics.CreateAPIView):
+    serializer_class = RegisterSerializer
+    permission_classes = [AllowAny]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+
+        send_verification_code(user)
+        return Response(
+            {"email": user.email, "pre_token": make_pre_token(user.id)},
+            status=201,
+        )
+
+
+
+
+class VerifyEmailView(generics.GenericAPIView):
+    serializer_class = VerifyEmailSerializer
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        user = get_user(data["pre_token"])
+        confirm_code(user, data["code"])     # 1. tasdiqla
+        user.is_active = True                # 2. ishingni qil
+        user.save()
+        finish_code(user)                    # 3. yop
+        return Response(
+            {"detail": "Email tasdiqlandi. Endi login qiling."}
+        )
+
+class LogoutGenericAPIView(GenericAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = LogoutModelSerializer
+
+    def post(self, request):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            RefreshToken(serializer.validated_data["refresh"]).blacklist()
+        except TokenError:
+            return Response({"detail": "Token yaroqsiz"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(status=status.HTTP_205_RESET_CONTENT)
+
+
+
+RESEND_INTERVAL = timedelta(seconds=60)
+
+
+class ResendCodeView(generics.GenericAPIView):
+    serializer_class = ResendCodeSerializer
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = get_user(serializer.validated_data["pre_token"])
+
+        record = EmailCode.objects.filter(user=user).first()
+        now = timezone.now()
+        if record and now - record.created_at < RESEND_INTERVAL:
+            return Response(
+                {"detail": "1 daqiqada faqat 1 marta"}, status=429
+            )
+
+        send_verification_code(user)
+        # yangi pre_token — yana 30 daqiqa
+        return Response({"pre_token": make_pre_token(user.id)})
